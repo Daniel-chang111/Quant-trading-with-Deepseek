@@ -1,0 +1,554 @@
+# ============================================================
+# 🚀 AI 기반 코스피 300개 종목 퀀트 트레이딩 시스템
+# ============================================================
+# 이 노트북은 코스피 300개 종목의 PER, PBR, 모멘텀, 변동성 데이터를 수집하고
+# AI 모델을 학습시켜 투자 종목을 선정합니다.
+#
+# 주요 기능:
+# 1. 캐시 시스템을 통한 고속 데이터 수집
+# 2. 병렬 처리로 300개 종목 동시 수집
+# 3. 2025년 전체 데이터로 AI 모델 학습
+# 4. 2026년 1월 투자 종목 선정
+# 5. 2월 성과 확인 및 백테스트
+# ============================================================
+
+# 1. 구글 코랩 메뉴에서 [런타임] → [런타임 다시 시작] 클릭!
+# (새로운 세션 시작 시 이전 변수와 패키지 충돌 방지)
+
+# ============================================================
+# 2. 필요한 패키지 설치 및 임포트
+# ============================================================
+
+# !pip install: 코랩에서 파이썬 패키지 설치 명령어
+# -q: 설치 과정을 조용히(quiet) 진행
+!pip install pykrx pandas numpy scikit-learn matplotlib seaborn -q
+
+import numpy as np                # 수치 계산 라이브러리 (배열, 행렬 연산)
+import pandas as pd               # 데이터 분석 라이브러리 (엑셀과 유사)
+import matplotlib.pyplot as plt   # 그래프 시각화 라이브러리
+from datetime import datetime, timedelta  # 날짜/시간 처리
+from pykrx import stock            # 한국 주식 데이터 라이브러리
+import time                        # 실행 시간 측정
+import os                          # 파일/폴더 경로 처리
+import pickle                      # 파이썬 객체 저장/불러오기 (캐시용)
+import warnings                    # 경고 메시지 제어
+warnings.filterwarnings('ignore')   # 불필요한 경고 메시지 숨김
+
+# 병렬 처리를 위한 라이브러리
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+print(f"✅ numpy: {np.__version__}")
+print(f"✅ pandas: {pd.__version__}")
+print("✅ 준비 완료!")
+
+
+# ============================================================
+# 1. 캐시 시스템 (가장 중요!)
+# ============================================================
+# 캐시란? 한 번 수집한 데이터를 파일로 저장해두고,
+# 다음에 같은 데이터가 필요할 때 빠르게 불러오는 기술
+# 이를 통해 데이터 수집 시간을 10분 → 1초로 단축
+
+class StockDataCache:
+    """
+    주식 데이터 캐시 관리 클래스
+    - stock_cache 폴더에 종목별/날짜별로 데이터 저장
+    - 다음에 같은 데이터 요청 시 파일에서 바로 불러옴
+    """
+    
+    def __init__(self, cache_dir='stock_cache'):
+        """
+        캐시 시스템 초기화
+        Args:
+            cache_dir: 캐시 파일 저장 폴더 (기본: 'stock_cache')
+        """
+        self.cache_dir = cache_dir
+        # 폴더가 없으면 자동 생성
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def get_cache_path(self, ticker, date):
+        """
+        캐시 파일 경로 생성
+        Args:
+            ticker: 종목 코드 (예: '005930')
+            date: 기준 날짜 (예: '20260213')
+        Returns:
+            파일 경로 (예: 'stock_cache/005930_20260213.pkl')
+        """
+        return f"{self.cache_dir}/{ticker}_{date}.pkl"
+
+    def save(self, ticker, date, data):
+        """
+        데이터를 캐시에 저장
+        Args:
+            ticker: 종목 코드
+            date: 기준 날짜
+            data: 저장할 데이터 (딕셔너리)
+        """
+        # 'wb': 쓰기(w) 바이너리(b) 모드
+        with open(self.get_cache_path(ticker, date), 'wb') as f:
+            # pickle.dump: 파이썬 객체를 파일로 저장
+            pickle.dump(data, f)
+
+    def load(self, ticker, date):
+        """
+        캐시에서 데이터 로드
+        Args:
+            ticker: 종목 코드
+            date: 기준 날짜
+        Returns:
+            저장된 데이터 (있으면), None (없으면)
+        """
+        path = self.get_cache_path(ticker, date)
+        # os.path.exists: 파일 존재 여부 확인
+        if os.path.exists(path):
+            # 'rb': 읽기(r) 바이너리(b) 모드
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        return None
+
+# 캐시 인스턴스 생성 (전역에서 사용)
+cache = StockDataCache()
+
+
+# ============================================================
+# 2. 단일 종목 데이터 수집 (캐시 적용)
+# ============================================================
+def fetch_ticker_data(ticker, date):
+    """
+    하나의 종목에 대한 데이터 수집
+    - 캐시 확인 → 있으면 캐시 사용, 없으면 새로 수집
+    - 수집 항목: PER, PBR, 모멘텀(1,3,6개월), 변동성, 현재가
+    
+    Args:
+        ticker: 종목 코드
+        date: 기준 날짜
+    Returns:
+        result 딕셔너리 (성공 시), None (실패 시)
+    """
+    
+    # 1. 캐시 확인
+    cached = cache.load(ticker, date)
+    if cached:
+        return cached  # 캐시에 있으면 바로 반환
+
+    try:
+        # 2. 종목명 조회
+        name = stock.get_market_ticker_name(ticker)
+
+        # 3. PER, PBR 데이터 조회
+        # get_market_fundamental: 재무제표 기반 데이터
+        df_fund = stock.get_market_fundamental(date, date, ticker)
+        if df_fund.empty:
+            return None
+
+        fund_row = df_fund.iloc[0]  # 첫 번째 행 (해당 날짜)
+        per = fund_row['PER'] if 'PER' in fund_row.index else np.nan
+        pbr = fund_row['PBR'] if 'PBR' in fund_row.index else np.nan
+
+        # PER이 유효하지 않으면 제외
+        if pd.isna(per) or pd.isna(pbr) or per <= 0:
+            return None
+
+        # 4. 가격 데이터 조회 (모멘텀, 변동성 계산용)
+        # 200일 전 날짜 계산
+        start_date = (datetime.strptime(date, '%Y%m%d') - timedelta(days=200)).strftime('%Y%m%d')
+        # get_market_ohlcv_by_date: 일별 OHLCV 데이터 (Open, High, Low, Close, Volume)
+        df_price = stock.get_market_ohlcv_by_date(start_date, date, ticker)
+
+        if len(df_price) < 100:  # 데이터가 너무 적으면 제외
+            return None
+
+        # 5. 모멘텀 계산
+        # 모멘텀 = (현재가 / 과거가 - 1) * 100 (백분율)
+        # iloc[-1]: 마지막 행(최신), iloc[-22]: 22일 전(약 1개월)
+        momentum_1m = (df_price['종가'].iloc[-1] / df_price['종가'].iloc[-22] - 1) * 100
+        momentum_3m = (df_price['종가'].iloc[-1] / df_price['종가'].iloc[-66] - 1) * 100
+        # 132일 전(약 6개월) 데이터가 있으면 계산
+        momentum_6m = (df_price['종가'].iloc[-1] / df_price['종가'].iloc[-132] - 1) * 100 if len(df_price) > 132 else 0
+        
+        # 6. 변동성 계산 (최근 60일 일간 수익률의 표준편차)
+        volatility = df_price['등락률'].tail(60).std()
+
+        # 7. 결과 딕셔너리 생성
+        result = {
+            '티커': ticker,
+            '종목': name,
+            'PER': round(per, 2),
+            'PBR': round(pbr, 2),
+            '모멘텀_1m': round(momentum_1m, 2),
+            '모멘텀_3m': round(momentum_3m, 2),
+            '모멘텀_6m': round(momentum_6m, 2),
+            '변동성': round(volatility, 2),
+            '현재가': df_price['종가'].iloc[-1]
+        }
+
+        # 8. 캐시 저장
+        cache.save(ticker, date, result)
+        return result
+
+    except Exception as e:
+        # 예외 발생 시 None 반환 (해당 종목 건너뜀)
+        return None
+
+
+# ============================================================
+# 3. 병렬 처리로 월별 데이터 수집
+# ============================================================
+def collect_month_data_parallel(date, max_workers=10):
+    """
+    한 달치 데이터를 병렬로 수집
+    - ThreadPoolExecutor로 여러 종목 동시 처리
+    - max_workers=10: 10개 종목씩 동시에 수집
+    
+    Args:
+        date: 기준 날짜
+        max_workers: 동시 처리 스레드 수
+    Returns:
+        해당 월의 종목 데이터프레임
+    """
+    
+    print(f"📅 {date} 수집중...")
+
+    # 종목 리스트 조회 (코스피 전체에서 300개만)
+    tickers = stock.get_market_ticker_list(date, market="KOSPI")[:300]
+
+    results = []
+    
+    # ThreadPoolExecutor로 병렬 처리
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 각 종목별로 fetch_ticker_data 함수 실행 예약
+        # executor.submit(함수, 인자1, 인자2) → Future 객체 반환
+        futures = {executor.submit(fetch_ticker_data, ticker, date): ticker
+                  for ticker in tickers}
+
+        # as_completed: 작업이 완료되는 대로 결과 반환
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                result['기준일'] = date  # 기준일 컬럼 추가
+                results.append(result)
+
+    # 리스트를 데이터프레임으로 변환
+    df = pd.DataFrame(results)
+    print(f"  ✅ {date}: {len(df)}개 종목")
+    return df
+
+
+# ============================================================
+# 4. 2025년 전체 데이터 수집 (병렬 + 캐시)
+# ============================================================
+def collect_2025_complete():
+    """
+    2025년 1월~12월 전체 데이터 수집
+    - 캐시가 있으면 1초, 없으면 3-5분 소요
+    - 12개월치 데이터를 모두 합쳐서 반환
+    
+    Returns:
+        2025년 전체 종목 데이터프레임
+    """
+
+    # 전체 캐시 파일 확인
+    cache_file = '2025_complete_cache.pkl'
+    if os.path.exists(cache_file):
+        print("📦 전체 캐시 발견! 즉시 로딩...")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    # 2025년 월별 마지막 거래일 목록
+    months = [
+        '20250131', '20250228', '20250331', '20250430',
+        '20250530', '20250630', '20250731', '20250829',
+        '20250930', '20251031', '20251128', '20251230'
+    ]
+
+    all_data = []
+    # 각 월별 데이터 수집
+    for month in months:
+        df_month = collect_month_data_parallel(month, max_workers=10)
+        if len(df_month) > 0:
+            all_data.append(df_month)
+
+    # 모든 월 데이터 합치기
+    final_df = pd.concat(all_data, ignore_index=True)
+
+    # 전체 캐시 저장 (다음 실행 때 빠르게 불러오기 위해)
+    with open(cache_file, 'wb') as f:
+        pickle.dump(final_df, f)
+
+    return final_df
+
+
+# ============================================================
+# 5. 다음달 수익률 추가 (진짜 target!)
+# ============================================================
+def add_future_returns(df):
+    """
+    각 종목의 다음달 수익률 계산
+    - target: 다음달 수익률이 양수면 1, 음수면 0
+    - 머신러닝이 학습할 정답(target) 생성
+    
+    Args:
+        df: 종목별 월별 데이터 (여러 달치)
+    Returns:
+        target이 추가된 데이터프레임
+    """
+
+    results = []
+    # 종목별로 그룹화
+    grouped = df.groupby('티커')
+
+    for ticker, group in grouped:
+        # 기준일 순으로 정렬 (1월, 2월, 3월...)
+        group = group.sort_values('기준일')
+
+        # 다음달 수익률 계산 (현재월과 다음월 데이터 필요)
+        for i in range(len(group)-1):
+            current = group.iloc[i]      # 현재월 데이터
+            next_row = group.iloc[i+1]   # 다음월 데이터
+
+            # 다음달 수익률 = (다음월 종가 / 현재월 종가 - 1) * 100
+            future_return = (next_row['현재가'] / current['현재가'] - 1) * 100
+
+            row_dict = current.to_dict()
+            row_dict['다음달수익률'] = round(future_return, 2)
+            # target: 양수면 1(상승), 음수면 0(하락)
+            row_dict['target'] = 1 if future_return > 0 else 0
+
+            results.append(row_dict)
+
+    return pd.DataFrame(results)
+
+
+# ============================================================
+# 실행!
+# ============================================================
+print("="*60)
+print("🚀 초고속 데이터 수집 시스템 (가격 데이터 포함)")
+print("="*60)
+
+# 1. 2025년 데이터 수집 (처음만 3-5분, 다음부터 1초)
+start = time.time()
+df_2025 = collect_2025_complete()
+print(f"\n✅ 2025년 데이터 수집 완료! {len(df_2025)}개")
+print(f"⏱️ 소요시간: {time.time()-start:.1f}초")
+
+# ============================================================
+# 2단계: 2025년 데이터로 투자 전략 수립
+# ============================================================
+
+print("="*60)
+print("🤖 AI 모델 학습 시작")
+print("="*60)
+
+# 먼저 다음달 수익률 추가
+print("\n📊 다음달 수익률 계산중...")
+df_train = add_future_returns(df_2025)
+print(f"✅ 학습 데이터 준비 완료! {len(df_train)}개 샘플")
+
+# AI 모델 학습을 위한 라이브러리 임포트
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
+
+# 특성과 타겟 분리
+# feature_cols: 모델이 학습할 특성(팩터) 목록
+feature_cols = ['PER', 'PBR', '모멘텀_1m', '모멘텀_3m', '변동성']
+X = df_train[feature_cols].values  # 입력 데이터
+y = df_train['target'].values      # 정답 (상승=1, 하락=0)
+
+# 데이터 정규화 (평균 0, 표준편차 1로 변환)
+# 특성 간 스케일 차이(예: PER 10-20, 변동성 1-3)를 없애기 위해
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# 학습/검증 데이터 분할 (80% 학습, 20% 검증)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_scaled, y, test_size=0.2, random_state=42
+)
+
+# 랜덤포레스트 모델 생성
+# n_estimators: 결정 트리 개수 (많을수록 성능↑, 시간↑)
+# max_depth: 트리 최대 깊이 (너무 깊으면 과적합)
+model = RandomForestClassifier(
+    n_estimators=200,
+    max_depth=10,
+    random_state=42
+)
+
+# 모델 학습
+model.fit(X_train, y_train)
+
+# 검증 데이터로 성능 평가
+y_pred = model.predict(X_val)
+accuracy = accuracy_score(y_val, y_pred)
+
+print(f"\n🤖 AI 모델 학습 완료!")
+print(f"✅ 검증 정확도: {accuracy:.2%}")
+
+# 특성 중요도 분석 (어떤 팩터가 중요한지)
+importance = pd.DataFrame({
+    '특성': feature_cols,
+    '중요도': model.feature_importances_
+}).sort_values('중요도', ascending=False)
+
+print("\n📊 특성 중요도:")
+print(importance.to_string(index=False))
+
+# ============================================================
+# 3단계: 2026년 1월 투자 종목 선정
+# ============================================================
+print("\n" + "="*60)
+print("💰 2026년 1월 투자 종목 선정")
+print("="*60)
+
+def select_stocks_jan2026(model, scaler, features):
+    """
+    2026년 1월 31일 데이터로 투자 종목 선정
+    - AI 모델이 예측한 상승 확률이 높은 종목 추천
+    
+    Args:
+        model: 학습된 AI 모델
+        scaler: 정규화 객체
+        features: 사용할 특성 목록
+    Returns:
+        상위 20개 추천 종목 데이터프레임
+    """
+    date = '20260130'  # 2026년 1월 마지막 거래일
+    tickers = stock.get_market_ticker_list(date, market="KOSPI")[:300]
+
+    stock_data = []
+
+    for ticker in tickers:
+        try:
+            name = stock.get_market_ticker_name(ticker)
+            df_fund = stock.get_market_fundamental(date, date, ticker)
+
+            if df_fund.empty:
+                continue
+
+            fund_row = df_fund.iloc[0]
+            per = fund_row['PER'] if 'PER' in fund_row.index else np.nan
+            pbr = fund_row['PBR'] if 'PBR' in fund_row.index else np.nan
+
+            if pd.isna(per) or pd.isna(pbr) or per <= 0:
+                continue
+
+            # 가격 데이터 조회
+            start_date = (datetime.strptime(date, '%Y%m%d') - timedelta(days=200)).strftime('%Y%m%d')
+            df_price = stock.get_market_ohlcv_by_date(start_date, date, ticker)
+
+            if len(df_price) < 100:
+                continue
+
+            # 모멘텀, 변동성 계산
+            momentum_1m = (df_price['종가'].iloc[-1] / df_price['종가'].iloc[-22] - 1) * 100
+            momentum_3m = (df_price['종가'].iloc[-1] / df_price['종가'].iloc[-66] - 1) * 100
+            volatility = df_price['등락률'].tail(60).std()
+
+            stock_data.append({
+                '종목': name,
+                '티커': ticker,
+                'PER': per,
+                'PBR': pbr,
+                '모멘텀_1m': momentum_1m,
+                '모멘텀_3m': momentum_3m,
+                '변동성': volatility,
+                '1월31일_가격': df_price['종가'].iloc[-1]
+            })
+
+        except:
+            continue
+
+    df_jan = pd.DataFrame(stock_data)
+    print(f"✅ {len(df_jan)}개 종목 데이터 수집 완료")
+
+    # AI 점수 계산 (상승 확률)
+    X_jan = scaler.transform(df_jan[features].values)
+    df_jan['AI_점수'] = model.predict_proba(X_jan)[:, 1]
+
+    # 종합 점수 (여기서는 AI 점수와 동일)
+    df_jan['종합점수'] = df_jan['AI_점수']
+
+    # 상위 20개 종목 선정
+    top_20 = df_jan.nlargest(20, '종합점수')
+
+    print("\n" + "="*70)
+    print("💰 2026년 1월 31일 투자 선정 종목 TOP 20")
+    print("="*70)
+    print(top_20[['종목', 'PER', 'PBR', '모멘텀_1m', 'AI_점수']].head(20).to_string(index=False))
+
+    return top_20
+
+# 실행
+portfolio_jan = select_stocks_jan2026(model, scaler, feature_cols)
+
+# ============================================================
+# 4단계: 2026년 2월 13일 성과 확인
+# ============================================================
+print("\n" + "="*60)
+print("📊 2026년 2월 13일 성과 확인")
+print("="*60)
+
+def check_feb_results(portfolio_jan):
+    """
+    1월에 선정한 종목들의 2월 13일 성과 확인
+    - 실제 수익률 계산으로 AI 전략의 성능 검증
+    
+    Args:
+        portfolio_jan: 1월 추천 종목 데이터
+    Returns:
+        종목별 수익률 데이터프레임
+    """
+
+    results = []
+    total_return = 0
+
+    for idx, row in portfolio_jan.iterrows():
+        ticker = row['티커']
+        name = row['종목']
+        buy_price = row['1월31일_가격']
+
+        try:
+            # 2월 13일 가격 조회
+            df_feb = stock.get_market_ohlcv_by_date('20260213', '20260213', ticker)
+
+            if df_feb.empty:
+                continue
+
+            feb_price = df_feb['종가'].iloc[0]
+            # 수익률 계산
+            return_pct = (feb_price / buy_price - 1) * 100
+
+            results.append({
+                '종목': name,
+                '매수가(1/31)': buy_price,
+                '현재가(2/13)': feb_price,
+                '수익률(%)': round(return_pct, 2),
+                'PER': row['PER'],
+                'PBR': row['PBR']
+            })
+
+        except:
+            continue
+
+    # 데이터프레임 생성 및 수익률 높은 순 정렬
+    df_results = pd.DataFrame(results)
+    df_results = df_results.sort_values('수익률(%)', ascending=False)
+
+    print("\n📈 개별 종목 성과:")
+    print(df_results.head(10).to_string(index=False))
+
+    print(f"\n{'='*70}")
+    print(f"📊 최종 결과")
+    print(f"{'='*70}")
+    print(f"✅ 분석 가능 종목: {len(df_results)}개")
+    print(f"✅ 평균 수익률: {df_results['수익률(%)'].mean():.2f}%")
+    print(f"✅ 상승 종목: {len(df_results[df_results['수익률(%)'] > 0])}개")
+    print(f"✅ 하락 종목: {len(df_results[df_results['수익률(%)'] < 0])}개")
+
+    return df_results
+
+# 실행
+feb_results = check_feb_results(portfolio_jan)
